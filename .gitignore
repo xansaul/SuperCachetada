@@ -1,0 +1,33 @@
+﻿/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+
+# Archivos de Visual Studio / VS Code
+.vs/
+.vscode/
+/*.csproj
+/*.sln
+/*.suo
+/*.user
+/*.userprefs
+/*.pidb
+/*.booproj
+/*.svd
+/*.pdb
+/*.opendb
+/*.IDB
+/*.PublicationConfig
+
+# Archivos de Sistema
+.DS_Store
+Thumbs.db
+
+# Crash reports de Unity
+sysinfo.txt
+
+# Assets de paquetes (opcional, pero recomendado si usas Package Manager)
+/[Aa]ssets/AssetStoreTools*
