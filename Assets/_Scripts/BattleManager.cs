@@ -2,319 +2,486 @@ using UnityEngine;
 using TMPro;
 using UnityEngine.UI;
 using System.Collections;
-using UnityEngine.SceneManagement; // Requerido para cambiar de escenas
+using UnityEngine.SceneManagement;
+using Unity.Netcode;
 
 /// <summary>
-/// Gestiona la lógica principal del combate, incluyendo turnos, generación de operaciones matemáticas,
-/// cálculo de daño, animaciones y fin del juego.
+/// BattleManager versión multijugador con Netcode for GameObjects.
+/// 
+/// ARQUITECTURA:
+/// - El HOST (jugador 1) es la autoridad: genera operaciones, valida
+///   respuestas y calcula el daño.
+/// - El CLIENTE (jugador 2) solo envía su respuesta y muestra los
+///   resultados que recibe del host.
+/// - Las variables importantes son NetworkVariable: se sincronizan 
+///   automáticamente de host a cliente.
+/// - submitAnswer del cliente se envía con ServerRpc.
+/// - Animaciones, mensajes y operación nueva se notifican con ClientRpc.
+/// - Al final del juego, el host envía un ClientRpc a todos para que
+///   apaguen su conexión y vuelvan al menú.
+/// - Si un jugador cierra el juego abruptamente, el otro detecta la
+///   desconexión y vuelve al menú con un mensaje informativo.
 /// </summary>
-public class BattleManager : MonoBehaviour
+public class BattleManager : NetworkBehaviour
 {
     // ==========================================
     // VARIABLES DEL INSPECTOR
     // ==========================================
 
     [Header("Conexiones de la UI")]
-    public TMP_Text textoOperacion;       // Muestra la ronda, turno y la operación matemática
-    public TMP_InputField entradaRespuesta; // Caja donde el jugador escribe su respuesta
-    public TMP_Text textoVida;            // Muestra la vida en formato numérico
-    public TMP_Text textoTiempo;          // Reloj de cuenta regresiva
+    public TMP_Text textoOperacion;
+    public TMP_InputField entradaRespuesta;
+    public TMP_Text textoVida;
+    public TMP_Text textoTiempo;
 
     [Header("Barras de Vida")]
-    public Slider barraVidaJ1;            // Barra visual de salud del Jugador 1
-    public Slider barraVidaJ2;            // Barra visual de salud del Jugador 2
+    public Slider barraVidaJ1;
+    public Slider barraVidaJ2;
 
     [Header("Estadísticas")]
-    public float vidaJugador1 = 100f;
-    public float vidaJugador2 = 100f;
-    public float danoBase = 20f;          // Daño máximo posible si responden instantáneamente
-    public float tiempoMaximo = 10f;      // Segundos permitidos por turno
-    public float retrasoAlEmpezar = 2f;   // Segundos de espera antes de mostrar la primera suma
-    public float tiempoEsperaFinJuego = 5f; // Segundos que el juego se pausa antes de ir al menú al ganar
+    public float vidaInicial = 100f;
+    public float danoBase = 20f;
+    public float tiempoMaximo = 10f;
+    public float retrasoAlEmpezar = 2f;
+    public float tiempoEsperaFinJuego = 5f;
+    public float tiempoEsperaDesconexion = 3f;
 
     [Header("Animación de Ataque")]
-    public float duracionPose = 0.3f;     // Tiempo que el personaje se queda con la mano estirada (pose de ataque)
-    public float distanciaMovimiento = 1.5f;   // Cuánto se desplaza el J1 hacia la derecha
-    public float distanciaMovimientoJ2 = 1.5f; // Cuánto se desplaza el J2 hacia la izquierda
+    public float duracionPose = 0.3f;
+    public float distanciaMovimiento = 1.5f;
+    public float distanciaMovimientoJ2 = 1.5f;
 
     [Header("Sprites Jugador 1")]
-    public SpriteRenderer renderizadorJ1; // Componente que dibuja al Jugador 1
-    public Sprite spriteJ1Quieto;         // Imagen normal (Idle)
-    public Sprite spriteJ1Ataque;         // Imagen atacando (Slap)
+    public SpriteRenderer renderizadorJ1;
+    public Sprite spriteJ1Quieto;
+    public Sprite spriteJ1Ataque;
 
     [Header("Sprites Jugador 2")]
-    public SpriteRenderer renderizadorJ2; // Componente que dibuja al Jugador 2
-    public Sprite spriteJ2Quieto;         // Imagen normal (Idle)
-    public Sprite spriteJ2Ataque;         // Imagen atacando (Slap)
+    public SpriteRenderer renderizadorJ2;
+    public Sprite spriteJ2Quieto;
+    public Sprite spriteJ2Ataque;
 
     [Header("Sonidos")]
-    public AudioSource fuenteAudio;       // Componente reproductor de sonido
-    public AudioClip sonidoSlap;          // Archivo de audio de la cachetada
+    public AudioSource fuenteAudio;
+    public AudioClip sonidoSlap;
 
     // ==========================================
-    // VARIABLES INTERNAS (ESTADO DEL JUEGO)
+    // NETWORK VARIABLES (sincronizadas automáticamente)
+    // ==========================================
+
+    private NetworkVariable<float> vidaJ1 = new NetworkVariable<float>(
+        100f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    private NetworkVariable<float> vidaJ2 = new NetworkVariable<float>(
+        100f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    private NetworkVariable<int> rondaActual = new NetworkVariable<int>(
+        1, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    // true = turno J1, false = turno J2
+    private NetworkVariable<bool> esTurnoJugador1 = new NetworkVariable<bool>(
+        true, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    private NetworkVariable<bool> juegoTerminado = new NetworkVariable<bool>(
+        false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+    // ==========================================
+    // VARIABLES INTERNAS DEL HOST
     // ==========================================
     private float tiempoActual;
-    private bool esTurnoJugador1 = true;  // Indica de quién es el turno (true = J1, false = J2)
-    private int respuestaCorrecta;        // Almacena el resultado de la operación actual
-    private bool juegoTerminado = false;  // Bloquea el juego si alguien pierde toda la vida
-    private bool esperandoSiguienteTurno = true; // Bloquea el tiempo y entradas durante animaciones/transiciones
-    private int rondaActual = 1;          // Sube cada vez que ambos jugadores completan su turno
+    private int respuestaCorrecta;
+    private bool esperandoSiguienteTurno = true;
 
     // ==========================================
-    // MÉTODOS PRINCIPALES
+    // INICIO Y FIN DEL CICLO DE VIDA EN RED
     // ==========================================
 
-    void Start()
+    public override void OnNetworkSpawn()
     {
-        // Inicializar los límites visuales de las barras de vida
-        if (barraVidaJ1 != null) { barraVidaJ1.maxValue = vidaJugador1; barraVidaJ1.value = vidaJugador1; }
-        if (barraVidaJ2 != null) { barraVidaJ2.maxValue = vidaJugador2; barraVidaJ2.value = vidaJugador2; }
+        // Inicializar visualmente las barras (en ambos lados)
+        if (barraVidaJ1 != null) { barraVidaJ1.maxValue = vidaInicial; barraVidaJ1.value = vidaInicial; }
+        if (barraVidaJ2 != null) { barraVidaJ2.maxValue = vidaInicial; barraVidaJ2.value = vidaInicial; }
 
-        // Asegurar que los personajes comiencen en su pose inactiva
         if (renderizadorJ1 != null) renderizadorJ1.sprite = spriteJ1Quieto;
         if (renderizadorJ2 != null) renderizadorJ2.sprite = spriteJ2Quieto;
 
-        // Configurar la pantalla de espera inicial
         textoOperacion.text = "¡PREPÁRATE!";
         if (textoTiempo != null) textoTiempo.text = "";
-        
-        // Llamar a la primera operación después del retraso configurado
-        Invoke("GenerarOperacion", retrasoAlEmpezar);
+
+        // Suscribirse a cambios de las NetworkVariables para refrescar UI
+        vidaJ1.OnValueChanged += (oldVal, newVal) => ActualizarUI();
+        vidaJ2.OnValueChanged += (oldVal, newVal) => ActualizarUI();
+        esTurnoJugador1.OnValueChanged += (oldVal, newVal) => ActualizarEstadoEntrada();
+        juegoTerminado.OnValueChanged += (oldVal, newVal) => ActualizarEstadoEntrada();
+
+        // Detectar desconexión del oponente
+        NetworkManager.Singleton.OnClientDisconnectCallback += AlDesconectarseCliente;
+
+        // Solo el host arranca el juego
+        if (IsServer)
+        {
+            vidaJ1.Value = vidaInicial;
+            vidaJ2.Value = vidaInicial;
+            rondaActual.Value = 1;
+            esTurnoJugador1.Value = true;
+            juegoTerminado.Value = false;
+
+            Invoke(nameof(GenerarOperacion), retrasoAlEmpezar);
+        }
+
+        ActualizarUI();
+        ActualizarEstadoEntrada();
     }
+
+    public override void OnNetworkDespawn()
+    {
+        // Desuscribirse del evento para evitar errores cuando se cambia de escena
+        if (NetworkManager.Singleton != null)
+        {
+            NetworkManager.Singleton.OnClientDisconnectCallback -= AlDesconectarseCliente;
+        }
+    }
+
+    // ==========================================
+    // UPDATE — solo el host corre el timer
+    // ==========================================
 
     void Update()
     {
-        // Detener el reloj si el juego terminó o si estamos en una pausa (animación/espera)
-        if (juegoTerminado || esperandoSiguienteTurno) return;
+        if (!IsServer) return;
+        if (juegoTerminado.Value || esperandoSiguienteTurno) return;
 
-        // Reducir el tiempo en función de los fotogramas del juego
         tiempoActual -= Time.deltaTime;
-        
-        // Actualizar el reloj visual
-        if (textoTiempo != null)
-        {
-            // Mostrar número entero redondeado hacia arriba
-            textoTiempo.text = Mathf.CeilToInt(tiempoActual).ToString();
-            // Cambiar a color rojo como advertencia cuando queden 3 segundos o menos
-            textoTiempo.color = (tiempoActual <= 3f) ? Color.red : Color.black;
-        }
 
-        // Detectar si el tiempo se agotó
+        MostrarTiempoClientRpc(tiempoActual);
+
         if (tiempoActual <= 0)
         {
-            esperandoSiguienteTurno = true; // Bloquear nuevas entradas
-            textoOperacion.text = "¡Tiempo agotado! Pierdes tu turno.";
+            esperandoSiguienteTurno = true;
+            MostrarMensajeClientRpc("¡Tiempo agotado! Pierde el turno.");
             PasarTurno();
         }
     }
 
-    /// <summary>
-    /// Genera una operación matemática aleatoria basada en la ronda actual.
-    /// La dificultad escala conforme avanza el juego.
-    /// </summary>
+    [ClientRpc]
+    void MostrarTiempoClientRpc(float tiempo)
+    {
+        if (textoTiempo != null)
+        {
+            textoTiempo.text = Mathf.CeilToInt(tiempo).ToString();
+            textoTiempo.color = (tiempo <= 3f) ? Color.red : Color.black;
+        }
+    }
+
+    // ==========================================
+    // GENERAR OPERACIÓN (solo host)
+    // ==========================================
+
     public void GenerarOperacion()
     {
-        if (juegoTerminado) return; 
+        if (!IsServer) return;
+        if (juegoTerminado.Value) return;
 
-        tiempoActual = tiempoMaximo;     // Reiniciar el reloj
-        esperandoSiguienteTurno = false; // Desbloquear el juego para que corra el Update
-        
+        tiempoActual = tiempoMaximo;
+        esperandoSiguienteTurno = false;
+
         int a = 0; int b = 0;
         string signoAritmetico = "";
-        int tipoOperacion = Random.Range(0, 4); // 0=Suma, 1=Resta, 2=Multiplicación, 3=División
+        int tipoOperacion = Random.Range(0, 4);
+        int ronda = rondaActual.Value;
 
-        // Lógica de escalado de dificultad basada en 'rondaActual'
         switch (tipoOperacion)
         {
-            case 0: // Suma (Sube de 5 en 5 el límite máximo por ronda)
-                a = Random.Range(1, 5 + (rondaActual * 5)); 
-                b = Random.Range(1, 5 + (rondaActual * 5)); 
-                respuestaCorrecta = a + b; 
-                signoAritmetico = "+"; 
+            case 0:
+                a = Random.Range(1, 5 + (ronda * 5));
+                b = Random.Range(1, 5 + (ronda * 5));
+                respuestaCorrecta = a + b;
+                signoAritmetico = "+";
                 break;
-            case 1: // Resta ('a' siempre es mayor que 'b' para evitar resultados negativos)
-                a = Random.Range(5, 10 + (rondaActual * 5)); 
-                b = Random.Range(1, a); 
-                respuestaCorrecta = a - b; 
-                signoAritmetico = "-"; 
+            case 1:
+                a = Random.Range(5, 10 + (ronda * 5));
+                b = Random.Range(1, a);
+                respuestaCorrecta = a - b;
+                signoAritmetico = "-";
                 break;
-            case 2: // Multiplicación (Escala lentamente de 1 en 1 para mantener jugabilidad)
-                a = Random.Range(2, 3 + rondaActual); 
-                b = Random.Range(2, 3 + rondaActual); 
-                respuestaCorrecta = a * b; 
-                signoAritmetico = "x"; 
+            case 2:
+                a = Random.Range(2, 3 + ronda);
+                b = Random.Range(2, 3 + ronda);
+                respuestaCorrecta = a * b;
+                signoAritmetico = "x";
                 break;
-            case 3: // División Exacta (Se crea primero la solución y luego se multiplican las partes para garantizar divisibilidad)
-                int divisor = Random.Range(2, 3 + rondaActual); 
-                int cociente = Random.Range(2, 3 + rondaActual); 
-                int dividendo = divisor * cociente; 
-                a = dividendo; 
-                b = divisor; 
-                respuestaCorrecta = cociente; 
-                signoAritmetico = "÷"; 
+            case 3:
+                int divisor = Random.Range(2, 3 + ronda);
+                int cociente = Random.Range(2, 3 + ronda);
+                int dividendo = divisor * cociente;
+                a = dividendo;
+                b = divisor;
+                respuestaCorrecta = cociente;
+                signoAritmetico = "÷";
                 break;
         }
-        
-        // Mostrar la información en pantalla
-        string nombreActual = esTurnoJugador1 ? "Jugador 1" : "Jugador 2";
-        textoOperacion.text = $"Ronda {rondaActual} - Turno de {nombreActual}\n{a} {signoAritmetico} {b} = ?";
-        ActualizarUI();
-        
-        // Preparar la caja de texto para que el usuario escriba sin tener que darle clic
-        entradaRespuesta.text = "";
-        entradaRespuesta.ActivateInputField();
+
+        MostrarOperacionClientRpc(a, b, signoAritmetico, rondaActual.Value, esTurnoJugador1.Value);
     }
 
-    /// <summary>
-    /// Se llama desde el InputField cuando el jugador presiona "Enter"
-    /// </summary>
-    /// <param name="input">El texto introducido por el usuario</param>
+    [ClientRpc]
+    void MostrarOperacionClientRpc(int a, int b, string signo, int ronda, bool turnoJ1)
+    {
+        string nombreActual = turnoJ1 ? "Jugador 1" : "Jugador 2";
+        textoOperacion.text = $"Ronda {ronda} - Turno de {nombreActual}\n{a} {signo} {b} = ?";
+
+        ActualizarEstadoEntrada();
+
+        if (EsMiTurno())
+        {
+            entradaRespuesta.text = "";
+            entradaRespuesta.ActivateInputField();
+        }
+    }
+
+    // ==========================================
+    // RESPUESTA DEL JUGADOR
+    // ==========================================
+
     public void ComprobarEntrada(string input)
     {
-        if (juegoTerminado || esperandoSiguienteTurno) return;
-        
-        // Intentar convertir el texto a número. Si es válido, se evalúa.
+        if (juegoTerminado.Value) return;
+        if (!EsMiTurno()) return;
+
         if (int.TryParse(input, out int respuestaNumerica))
         {
-            EvaluarRespuesta(respuestaNumerica == respuestaCorrecta);
+            EnviarRespuestaServerRpc(respuestaNumerica);
         }
     }
 
-    /// <summary>
-    /// Calcula el daño si la respuesta fue correcta y dispara animaciones/sonidos.
-    /// </summary>
+    [ServerRpc(RequireOwnership = false)]
+    void EnviarRespuestaServerRpc(int valor, ServerRpcParams rpcParams = default)
+    {
+        if (juegoTerminado.Value || esperandoSiguienteTurno) return;
+
+        ulong senderId = rpcParams.Receive.SenderClientId;
+        bool senderEsHost = (senderId == NetworkManager.ServerClientId);
+        bool senderEsTurno = (senderEsHost && esTurnoJugador1.Value) ||
+                             (!senderEsHost && !esTurnoJugador1.Value);
+
+        if (!senderEsTurno)
+        {
+            Debug.LogWarning($"[BattleManager] Cliente {senderId} envió respuesta fuera de turno. Ignorada.");
+            return;
+        }
+
+        EvaluarRespuesta(valor == respuestaCorrecta);
+    }
+
     void EvaluarRespuesta(bool esCorrecta)
     {
-        esperandoSiguienteTurno = true; // Pausa el juego mientras vemos el resultado
-        
+        if (!IsServer) return;
+
+        esperandoSiguienteTurno = true;
+
         if (esCorrecta)
         {
-            // Reproducir sonido de golpe
-            if(fuenteAudio != null && sonidoSlap != null) fuenteAudio.PlayOneShot(sonidoSlap);
-            
-            // Cálculo de daño: Responder al instante hace daño máximo (20). 
-            // Responder a los 5s (mitad del tiempo) hace 10 de daño.
             float multiplicador = tiempoActual / tiempoMaximo;
             float dano = danoBase * multiplicador;
-            
-            // Aplicar daño y lanzar animación al jugador correspondiente
-            if (esTurnoJugador1)
+
+            if (esTurnoJugador1.Value)
             {
-                vidaJugador2 -= dano;
-                if (renderizadorJ1 != null) StartCoroutine(AnimarAtaque(renderizadorJ1, spriteJ1Ataque, spriteJ1Quieto, distanciaMovimiento));
+                vidaJ2.Value = Mathf.Max(0, vidaJ2.Value - dano);
+                ReproducirAtaqueClientRpc(true);
             }
             else
             {
-                vidaJugador1 -= dano;
-                // El J2 usa distancia negativa (-distanciaMovimientoJ2) para moverse hacia la izquierda
-                if (renderizadorJ2 != null) StartCoroutine(AnimarAtaque(renderizadorJ2, spriteJ2Ataque, spriteJ2Quieto, -distanciaMovimientoJ2));
+                vidaJ1.Value = Mathf.Max(0, vidaJ1.Value - dano);
+                ReproducirAtaqueClientRpc(false);
             }
-            textoOperacion.text = "¡Correcto! Daño: " + Mathf.Round(dano); 
+
+            MostrarMensajeClientRpc("¡Correcto! Daño: " + Mathf.Round(dano));
         }
         else
         {
-            textoOperacion.text = "¡Respuesta Incorrecta! Pierdes el turno.";
+            MostrarMensajeClientRpc("¡Respuesta Incorrecta! Pierde el turno.");
         }
-        
-        ActualizarUI();
-        RevisarFinDeJuego(); 
+
+        RevisarFinDeJuego();
     }
 
-    /// <summary>
-    /// Corrutina para animar el salto del personaje hacia adelante, cambiar su imagen y devolverlo.
-    /// </summary>
+    [ClientRpc]
+    void MostrarMensajeClientRpc(string mensaje)
+    {
+        textoOperacion.text = mensaje;
+    }
+
+    [ClientRpc]
+    void ReproducirAtaqueClientRpc(bool ataqueJ1)
+    {
+        if (fuenteAudio != null && sonidoSlap != null) fuenteAudio.PlayOneShot(sonidoSlap);
+
+        if (ataqueJ1 && renderizadorJ1 != null)
+            StartCoroutine(AnimarAtaque(renderizadorJ1, spriteJ1Ataque, spriteJ1Quieto, distanciaMovimiento));
+        else if (!ataqueJ1 && renderizadorJ2 != null)
+            StartCoroutine(AnimarAtaque(renderizadorJ2, spriteJ2Ataque, spriteJ2Quieto, -distanciaMovimientoJ2));
+    }
+
     IEnumerator AnimarAtaque(SpriteRenderer renderizador, Sprite spriteAtq, Sprite spriteNrm, float direccion)
     {
         Transform t = renderizador.transform;
         Vector3 posOrig = t.position;
-        Vector3 posObj = posOrig + new Vector3(direccion, 0, 0); // Calcula a dónde va a saltar
+        Vector3 posObj = posOrig + new Vector3(direccion, 0, 0);
 
-        renderizador.sprite = spriteAtq; // Cambia a imagen de golpe
-        
-        // Movimiento de Ida (muy rápido: 0.05 segundos) usando Interpolación Lineal (Lerp)
+        renderizador.sprite = spriteAtq;
+
         float tiempo = 0;
-        while (tiempo < 0.05f) { 
-            t.position = Vector3.Lerp(posOrig, posObj, tiempo / 0.05f); 
-            tiempo += Time.deltaTime; 
-            yield return null; 
+        while (tiempo < 0.05f)
+        {
+            t.position = Vector3.Lerp(posOrig, posObj, tiempo / 0.05f);
+            tiempo += Time.deltaTime;
+            yield return null;
         }
-        t.position = posObj; // Asegura precisión al terminar la ida
+        t.position = posObj;
 
-        // Mantiene la pose de ataque un instante
         yield return new WaitForSeconds(duracionPose);
 
-        renderizador.sprite = spriteNrm; // Regresa a imagen de inactividad
-        
-        // Movimiento de Vuelta (un poco más lento: 0.15 segundos)
+        renderizador.sprite = spriteNrm;
+
         tiempo = 0;
-        while (tiempo < 0.15f) { 
-            t.position = Vector3.Lerp(posObj, posOrig, tiempo / 0.15f); 
-            tiempo += Time.deltaTime; 
-            yield return null; 
+        while (tiempo < 0.15f)
+        {
+            t.position = Vector3.Lerp(posObj, posOrig, tiempo / 0.15f);
+            tiempo += Time.deltaTime;
+            yield return null;
         }
-        t.position = posOrig; // Asegura precisión al terminar la vuelta
+        t.position = posOrig;
     }
 
-    /// <summary>
-    /// Comprueba las barras de vida para determinar si la batalla ha concluido.
-    /// </summary>
+    // ==========================================
+    // FIN DE TURNO Y FIN DE JUEGO (solo host)
+    // ==========================================
+
     void RevisarFinDeJuego()
     {
-        if (vidaJugador1 <= 0 || vidaJugador2 <= 0)
-        {
-            juegoTerminado = true;
-            entradaRespuesta.gameObject.SetActive(false); // Esconde la caja de respuesta
-            
-            // Declarar al ganador
-            if (vidaJugador1 <= 0) textoOperacion.text = "¡El Jugador 2 es el Ganador!";
-            else textoOperacion.text = "¡El Jugador 1 es el Ganador!";
-            
-            if (textoTiempo != null) textoTiempo.gameObject.SetActive(false); // Esconde el reloj
+        if (!IsServer) return;
 
-            // Esperar el tiempo parametrizable antes de regresar al Menú Principal
-            Invoke("RegresarAlMenu", tiempoEsperaFinJuego);
+        if (vidaJ1.Value <= 0 || vidaJ2.Value <= 0)
+        {
+            juegoTerminado.Value = true;
+
+            string mensaje = (vidaJ1.Value <= 0)
+                ? "¡El Jugador 2 es el Ganador!"
+                : "¡El Jugador 1 es el Ganador!";
+            MostrarFinJuegoClientRpc(mensaje);
+
+            Invoke(nameof(NotificarRegresoAlMenu), tiempoEsperaFinJuego);
         }
-        else 
-        { 
-            PasarTurno(); 
+        else
+        {
+            PasarTurno();
         }
     }
 
-    /// <summary>
-    /// Función auxiliar para cargar la escena 0 (Menú)
-    /// </summary>
-    void RegresarAlMenu()
+    [ClientRpc]
+    void MostrarFinJuegoClientRpc(string mensaje)
     {
+        textoOperacion.text = mensaje;
+        if (entradaRespuesta != null) entradaRespuesta.gameObject.SetActive(false);
+        if (textoTiempo != null) textoTiempo.gameObject.SetActive(false);
+    }
+
+    void NotificarRegresoAlMenu()
+    {
+        if (!IsServer) return;
+        RegresarAlMenuClientRpc();
+    }
+
+    [ClientRpc]
+    void RegresarAlMenuClientRpc()
+    {
+        if (NetworkManager.Singleton != null && NetworkManager.Singleton.IsListening)
+        {
+            NetworkManager.Singleton.Shutdown();
+        }
         SceneManager.LoadScene(0);
     }
 
-    /// <summary>
-    /// Cambia los booleanos de turno y programa la siguiente ronda
-    /// </summary>
     void PasarTurno()
     {
-        esTurnoJugador1 = !esTurnoJugador1; // Invierte el booleano
-        
-        // Si vuelve a ser el turno del J1, significa que terminó una ronda completa
-        if (esTurnoJugador1) rondaActual++; 
-        
-        // Dar tiempo a los jugadores para leer el resultado antes de la siguiente pregunta
-        Invoke("GenerarOperacion", 2f); 
+        if (!IsServer) return;
+
+        esTurnoJugador1.Value = !esTurnoJugador1.Value;
+        if (esTurnoJugador1.Value) rondaActual.Value++;
+
+        Invoke(nameof(GenerarOperacion), 2f);
+    }
+
+    // ==========================================
+    // MANEJO DE DESCONEXIÓN
+    // ==========================================
+
+    /// <summary>
+    /// Se ejecuta cuando algún cliente se desconecta de la red.
+    /// 
+    /// CASOS POSIBLES:
+    /// - Si soy el HOST y se desconectó el cliente: el oponente cerró el juego.
+    /// - Si soy el CLIENTE y el host se desconectó: el host cerró el juego
+    ///   (en este caso, clientId = 0 = el id del servidor).
+    /// 
+    /// En ambos escenarios, el jugador que se queda debe volver al menú con
+    /// un mensaje informativo.
+    /// </summary>
+    void AlDesconectarseCliente(ulong clientId)
+    {
+        // Si el juego ya terminó normalmente, ignorar (el regreso al menú
+        // ya está siendo manejado por RegresarAlMenuClientRpc).
+        if (juegoTerminado.Value) return;
+
+        Debug.Log($"[BattleManager] Cliente {clientId} se desconectó. Volviendo al menú.");
+
+        if (textoOperacion != null)
+            textoOperacion.text = "El oponente se desconectó.\nVolviendo al menú...";
+
+        if (entradaRespuesta != null) entradaRespuesta.gameObject.SetActive(false);
+        if (textoTiempo != null) textoTiempo.gameObject.SetActive(false);
+
+        // Cancelar cualquier Invoke pendiente para evitar comportamiento extraño
+        CancelInvoke();
+
+        Invoke(nameof(ForzarRegresoAlMenu), tiempoEsperaDesconexion);
     }
 
     /// <summary>
-    /// Sincroniza los valores numéricos con los elementos visuales de la interfaz
+    /// Apaga la red local y regresa al menú.
+    /// No usa ClientRpc porque solo somos uno (el otro ya se desconectó).
     /// </summary>
+    void ForzarRegresoAlMenu()
+    {
+        if (NetworkManager.Singleton != null && NetworkManager.Singleton.IsListening)
+        {
+            NetworkManager.Singleton.Shutdown();
+        }
+        SceneManager.LoadScene(0);
+    }
+
+    // ==========================================
+    // UI HELPERS
+    // ==========================================
+
     void ActualizarUI()
     {
-        // Mathf.Max(0, valor) asegura que visualmente la vida no muestre números negativos
-        float v1 = Mathf.Max(0, vidaJugador1); 
-        float v2 = Mathf.Max(0, vidaJugador2);
-        
-        textoVida.text = "J1: " + Mathf.Round(v1) + " HP  |  J2: " + Mathf.Round(v2) + " HP";
-        
+        float v1 = Mathf.Max(0, vidaJ1.Value);
+        float v2 = Mathf.Max(0, vidaJ2.Value);
+
+        if (textoVida != null)
+            textoVida.text = "J1: " + Mathf.Round(v1) + " HP  |  J2: " + Mathf.Round(v2) + " HP";
         if (barraVidaJ1 != null) barraVidaJ1.value = v1;
         if (barraVidaJ2 != null) barraVidaJ2.value = v2;
+    }
+
+    bool EsMiTurno()
+    {
+        if (esTurnoJugador1.Value) return IsHost;
+        else return !IsHost && IsClient;
+    }
+
+    void ActualizarEstadoEntrada()
+    {
+        if (entradaRespuesta == null) return;
+
+        bool miTurno = EsMiTurno();
+        entradaRespuesta.interactable = miTurno && !juegoTerminado.Value;
     }
 }
